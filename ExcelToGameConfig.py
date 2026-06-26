@@ -5,6 +5,7 @@ import os
 import struct
 import sys
 from datetime import datetime
+from time import perf_counter
 from typing import Any, Dict, List
 
 import openpyxl
@@ -30,6 +31,8 @@ SUPPORTED_TYPES = {
     TYPE_STRING_ARR2,
 }
 BACKUP_NAME_MARKER = "备份"
+LARGE_SHEET_ROW_THRESHOLD = 100_000
+BLANK_ROW_STOP_THRESHOLD = 256
 
 
 def _default_base_dir() -> str:
@@ -154,16 +157,24 @@ def _cast_by_type(value: Any, typ: str) -> Any:
 
 
 def _sheet_to_table(ws) -> Dict[str, Any]:
+    start_time = perf_counter()
     cols: List[int] = []
     field_names: List[str] = []
     field_types: List[str] = []
+    max_row = ws.max_row or 0
+    max_column = ws.max_column or 0
 
     # Row 1: comment only, ignored by exporter.
     # Row 2: field names.
     # Row 3: field types.
-    for c in range(1, ws.max_column + 1):
-        key = ws.cell(row=2, column=c).value
-        typ = ws.cell(row=3, column=c).value
+    header_rows = list(ws.iter_rows(min_row=1, max_row=3, values_only=True))
+    name_row = header_rows[1] if len(header_rows) >= 2 else ()
+    type_row = header_rows[2] if len(header_rows) >= 3 else ()
+    header_width = max(len(name_row), len(type_row), max_column)
+
+    for idx in range(header_width):
+        key = name_row[idx] if idx < len(name_row) else None
+        typ = type_row[idx] if idx < len(type_row) else None
         if key is None or str(key).strip() == "":
             continue
         if typ is None:
@@ -174,16 +185,23 @@ def _sheet_to_table(ws) -> Dict[str, Any]:
             continue
         if typ_text not in SUPPORTED_TYPES:
             raise ValueError(f"Unsupported type '{typ_text}' in sheet '{ws.title}', column '{key}'")
-        cols.append(c)
+        cols.append(idx + 1)
         field_names.append(str(key).strip())
         field_types.append(typ_text)
 
     rows: List[Dict[str, Any]] = []
-    for r in range(4, ws.max_row + 1):
+    scanned_rows = 0
+    blank_run = 0
+    early_stopped = False
+    large_sheet = max_row >= LARGE_SHEET_ROW_THRESHOLD
+
+    for row_values in ws.iter_rows(min_row=4, values_only=True):
+        scanned_rows += 1
         row_obj: Dict[str, Any] = {}
         empty = True
         for idx, key in enumerate(field_names):
-            raw = ws.cell(row=r, column=cols[idx]).value
+            col_index = cols[idx] - 1
+            raw = row_values[col_index] if col_index < len(row_values) else None
             raw_blank = raw is None or (isinstance(raw, str) and raw.strip() == "")
             if not raw_blank:
                 empty = False
@@ -192,6 +210,23 @@ def _sheet_to_table(ws) -> Dict[str, Any]:
             row_obj[key] = _cast_by_type(raw, field_types[idx])
         if not empty:
             rows.append(row_obj)
+            blank_run = 0
+        else:
+            blank_run += 1
+            if large_sheet and blank_run >= BLANK_ROW_STOP_THRESHOLD:
+                early_stopped = True
+                break
+
+    elapsed = perf_counter() - start_time
+    if early_stopped:
+        print(
+            f"Warning: sheet '{ws.title}' reports max_row={max_row}; "
+            f"stopped after {blank_run} consecutive blank rows to avoid used-range bloat."
+        )
+    print(
+        f"Sheet: {ws.title} | max_row={max_row} | scanned_rows={scanned_rows} | "
+        f"export_rows={len(rows)} | fields={len(field_names)} | elapsed={elapsed:.3f}s"
+    )
 
     return {
         "name": ws.title,
@@ -213,19 +248,27 @@ def build_tables(input_dir: str) -> List[Dict[str, Any]]:
     if not excel_files:
         raise FileNotFoundError(f"No Excel files found in: {input_dir}")
 
+    total_start = perf_counter()
     for excel_path in excel_files:
-        wb = openpyxl.load_workbook(excel_path, data_only=True)
-        for sheet_name in wb.sheetnames:
-            if _is_backup_name(sheet_name):
-                # Backup sheets are intentionally excluded from game_config.bin.
-                continue
-            if sheet_name.lower().endswith("_map"):
-                # Mapping tables are not exported into game_config.bin.
-                continue
-            if sheet_name in existing_sheet_names:
-                raise ValueError(f"Duplicate sheet name detected across excels: {sheet_name}")
-            existing_sheet_names.add(sheet_name)
-            tables.append(_sheet_to_table(wb[sheet_name]))
+        excel_start = perf_counter()
+        print(f"Loading workbook: {os.path.basename(excel_path)}")
+        wb = openpyxl.load_workbook(excel_path, data_only=True, read_only=True)
+        try:
+            for sheet_name in wb.sheetnames:
+                if _is_backup_name(sheet_name):
+                    # Backup sheets are intentionally excluded from game_config.bin.
+                    continue
+                if sheet_name.lower().endswith("_map"):
+                    # Mapping tables are not exported into game_config.bin.
+                    continue
+                if sheet_name in existing_sheet_names:
+                    raise ValueError(f"Duplicate sheet name detected across excels: {sheet_name}")
+                existing_sheet_names.add(sheet_name)
+                tables.append(_sheet_to_table(wb[sheet_name]))
+        finally:
+            wb.close()
+        print(f"Workbook done: {os.path.basename(excel_path)} | elapsed={perf_counter() - excel_start:.3f}s")
+    print(f"Build tables done: tables={len(tables)} | elapsed={perf_counter() - total_start:.3f}s")
     return tables
 
 
@@ -341,6 +384,14 @@ def write_game_config_bin(output_dir: str, tables: List[Dict[str, Any]]) -> str:
     return path
 
 
+def write_game_config_json(output_dir: str, tables: List[Dict[str, Any]]) -> str:
+    _safe_mkdir(output_dir)
+    path = os.path.join(output_dir, "game_config.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"tables": tables}, f, ensure_ascii=False, indent=4)
+    return path
+
+
 def write_version_file(output_dir: str, version: str, config_path: str) -> str:
     with open(config_path, "rb") as f:
         raw = f.read()
@@ -366,6 +417,7 @@ def main() -> int:
 
     tables = build_tables(input_dir)
     config_path = write_game_config_bin(output_dir, tables)
+    json_path = write_game_config_json(output_dir, tables)
     version_path = write_version_file(output_dir, version, config_path)
 
     print("Build game_config.bin success")
@@ -373,6 +425,7 @@ def main() -> int:
     print(f"OutputDir: {output_dir}")
     print(f"Version: {version}")
     print(f"Config: {config_path}")
+    print(f"Json: {json_path}")
     print(f"VersionFile: {version_path}")
     print(f"TableCount: {len(tables)}")
     return 0
