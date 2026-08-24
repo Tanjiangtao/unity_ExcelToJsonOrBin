@@ -2,3 +2,5 @@
 .omx/
 .venv/
 __pycache__/
+.pyinstaller/
+dist/

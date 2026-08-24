@@ -4,6 +4,7 @@ import json
 import os
 import struct
 import sys
+import traceback
 from datetime import datetime
 from time import perf_counter
 from typing import Any, Dict, List
@@ -48,6 +49,88 @@ def _default_output_dir(base_dir: str) -> str:
 
 def _safe_mkdir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _show_result_dialog(title: str, message: str, success: bool, auto_close_ms: int = 0) -> None:
+    """Show an export result dialog, falling back to console output if Tk is unavailable."""
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+
+        root = tk.Tk()
+        root.title(title)
+        root.attributes("-topmost", True)
+        root.resizable(False, False)
+
+        frame = ttk.Frame(root, padding=20)
+        frame.grid(row=0, column=0, sticky="nsew")
+
+        heading = "导表成功" if success else "导表失败"
+        heading_label = ttk.Label(frame, text=heading, font=("Microsoft YaHei UI", 14, "bold"))
+        heading_label.grid(row=0, column=0, sticky="w")
+
+        message_label = ttk.Label(
+            frame,
+            text=message,
+            font=("Microsoft YaHei UI", 10),
+            justify="left",
+            wraplength=560,
+        )
+        message_label.grid(row=1, column=0, sticky="w", pady=(12, 0))
+
+        if success:
+            timeout_label = ttk.Label(frame, text="窗口将在 3 秒后自动关闭")
+            timeout_label.grid(row=2, column=0, sticky="w", pady=(14, 0))
+        else:
+            close_button = ttk.Button(frame, text="确定", command=root.destroy)
+            close_button.grid(row=2, column=0, sticky="e", pady=(18, 0))
+            close_button.focus_set()
+
+        root.update_idletasks()
+        width = root.winfo_reqwidth()
+        height = root.winfo_reqheight()
+        x = max(0, (root.winfo_screenwidth() - width) // 2)
+        y = max(0, (root.winfo_screenheight() - height) // 2)
+        root.geometry(f"+{x}+{y}")
+        root.lift()
+
+        if auto_close_ms > 0:
+            root.after(auto_close_ms, root.destroy)
+        root.mainloop()
+    except Exception as dialog_error:
+        print(f"无法显示结果弹窗: {dialog_error}", file=sys.stderr)
+
+
+def _format_export_error(exc: BaseException) -> str:
+    chain: List[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    root_cause = chain[-1]
+    detail = str(exc).strip() or repr(exc)
+
+    if isinstance(root_cause, PermissionError):
+        target = getattr(root_cause, "filename", None)
+        reason = "没有权限访问目标文件，文件也可能正被 Excel 或其他程序占用。"
+        if target:
+            reason += f"\n目标文件：{target}"
+    elif isinstance(root_cause, FileNotFoundError):
+        reason = "没有找到需要的文件或目录。"
+    elif isinstance(root_cause, OSError) and getattr(root_cause, "errno", None) == 28:
+        reason = "磁盘空间不足，无法写入导表结果。"
+    else:
+        reason = detail
+
+    if reason != detail:
+        reason += f"\n\n详细信息：{detail}"
+    return f"{reason}\n\n错误类型：{root_cause.__class__.__name__}"
+
+
+def _short_value(value: Any, limit: int = 120) -> str:
+    text = repr(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def _is_excel_file(name: str) -> bool:
@@ -207,7 +290,14 @@ def _sheet_to_table(ws) -> Dict[str, Any]:
                 empty = False
             if raw_blank:
                 continue
-            row_obj[key] = _cast_by_type(raw, field_types[idx])
+            try:
+                row_obj[key] = _cast_by_type(raw, field_types[idx])
+            except (TypeError, ValueError, OverflowError) as exc:
+                excel_row = scanned_rows + 3
+                raise ValueError(
+                    f"数据转换失败：工作表 '{ws.title}'，第 {excel_row} 行，"
+                    f"字段 '{key}'，声明类型 '{field_types[idx]}'，原始值 {_short_value(raw)}"
+                ) from exc
         if not empty:
             rows.append(row_obj)
             blank_run = 0
@@ -252,21 +342,24 @@ def build_tables(input_dir: str) -> List[Dict[str, Any]]:
     for excel_path in excel_files:
         excel_start = perf_counter()
         print(f"Loading workbook: {os.path.basename(excel_path)}")
-        wb = openpyxl.load_workbook(excel_path, data_only=True, read_only=True)
         try:
-            for sheet_name in wb.sheetnames:
-                if _is_backup_name(sheet_name):
-                    # Backup sheets are intentionally excluded from game_config.bin.
-                    continue
-                if sheet_name.lower().endswith("_map"):
-                    # Mapping tables are not exported into game_config.bin.
-                    continue
-                if sheet_name in existing_sheet_names:
-                    raise ValueError(f"Duplicate sheet name detected across excels: {sheet_name}")
-                existing_sheet_names.add(sheet_name)
-                tables.append(_sheet_to_table(wb[sheet_name]))
-        finally:
-            wb.close()
+            wb = openpyxl.load_workbook(excel_path, data_only=True, read_only=True)
+            try:
+                for sheet_name in wb.sheetnames:
+                    if _is_backup_name(sheet_name):
+                        # Backup sheets are intentionally excluded from game_config.bin.
+                        continue
+                    if sheet_name.lower().endswith("_map"):
+                        # Mapping tables are not exported into game_config.bin.
+                        continue
+                    if sheet_name in existing_sheet_names:
+                        raise ValueError(f"多个 Excel 中存在同名工作表：'{sheet_name}'")
+                    existing_sheet_names.add(sheet_name)
+                    tables.append(_sheet_to_table(wb[sheet_name]))
+            finally:
+                wb.close()
+        except Exception as exc:
+            raise RuntimeError(f"处理 Excel 文件 '{os.path.basename(excel_path)}' 失败：{exc}") from exc
         print(f"Workbook done: {os.path.basename(excel_path)} | elapsed={perf_counter() - excel_start:.3f}s")
     print(f"Build tables done: tables={len(tables)} | elapsed={perf_counter() - total_start:.3f}s")
     return tables
@@ -415,20 +508,33 @@ def main() -> int:
     output_dir = _default_output_dir(base_dir)
     version = _resolve_version()
 
-    tables = build_tables(input_dir)
-    config_path = write_game_config_bin(output_dir, tables)
-    json_path = write_game_config_json(output_dir, tables)
-    version_path = write_version_file(output_dir, version, config_path)
+    try:
+        tables = build_tables(input_dir)
+        config_path = write_game_config_bin(output_dir, tables)
+        json_path = write_game_config_json(output_dir, tables)
+        version_path = write_version_file(output_dir, version, config_path)
 
-    print("Build game_config.bin success")
-    print(f"InputDir: {input_dir}")
-    print(f"OutputDir: {output_dir}")
-    print(f"Version: {version}")
-    print(f"Config: {config_path}")
-    print(f"Json: {json_path}")
-    print(f"VersionFile: {version_path}")
-    print(f"TableCount: {len(tables)}")
-    return 0
+        print("Build game_config.bin success")
+        print(f"InputDir: {input_dir}")
+        print(f"OutputDir: {output_dir}")
+        print(f"Version: {version}")
+        print(f"Config: {config_path}")
+        print(f"Json: {json_path}")
+        print(f"VersionFile: {version_path}")
+        print(f"TableCount: {len(tables)}")
+
+        success_message = (
+            f"共导出 {len(tables)} 个配置表\n"
+            f"输出目录：{output_dir}\n"
+            f"版本：{version}"
+        )
+        _show_result_dialog("导表成功", success_message, success=True, auto_close_ms=3000)
+        return 0
+    except Exception as exc:
+        traceback.print_exc()
+        error_message = _format_export_error(exc)
+        _show_result_dialog("导表失败", error_message, success=False)
+        return 1
 
 
 if __name__ == "__main__":
