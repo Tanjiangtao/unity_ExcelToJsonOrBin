@@ -2,7 +2,9 @@ import ast
 import hashlib
 import json
 import os
+import re
 import struct
+import subprocess
 import sys
 import traceback
 from datetime import datetime
@@ -52,7 +54,7 @@ def _safe_mkdir(path: str) -> None:
 
 
 def _show_result_dialog(title: str, message: str, success: bool, auto_close_ms: int = 0) -> None:
-    """Show an export result dialog, falling back to console output if Tk is unavailable."""
+    """Show an export result dialog with Tk and macOS native fallbacks."""
     try:
         import tkinter as tk
         from tkinter import ttk
@@ -98,7 +100,22 @@ def _show_result_dialog(title: str, message: str, success: bool, auto_close_ms: 
             root.after(auto_close_ms, root.destroy)
         root.mainloop()
     except Exception as dialog_error:
-        print(f"无法显示结果弹窗: {dialog_error}", file=sys.stderr)
+        # PyInstaller windowed apps may not include a working Tcl/Tk runtime.
+        # Use macOS's built-in dialog so double-click failures remain visible.
+        try:
+            def _apple_script_text(value: str) -> str:
+                return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+            script = (
+                f'display dialog "{_apple_script_text(message)}" '
+                f'with title "{_apple_script_text(title)}" '
+                f'buttons {{"确定"}} default button "确定"'
+            )
+            if success and auto_close_ms > 0:
+                script += f" giving up after {max(1, auto_close_ms // 1000)}"
+            subprocess.run(["/usr/bin/osascript", "-e", script], check=False)
+        except Exception as native_dialog_error:
+            print(f"无法显示结果弹窗: {dialog_error}; macOS 弹窗失败: {native_dialog_error}", file=sys.stderr)
 
 
 def _format_export_error(exc: BaseException) -> str:
@@ -164,6 +181,26 @@ def _parse_json_text(value: Any) -> Any:
     return value
 
 
+def _parse_array_text(value: Any, typ: str) -> Any:
+    """Parse JSON arrays and the comma-delimited notation common in Excel."""
+    parsed = _parse_json_text(value)
+    if not isinstance(parsed, str):
+        return parsed
+
+    text = parsed.strip()
+    if text == "":
+        return []
+
+    if typ in (TYPE_INT_ARR2, TYPE_FLOAT_ARR2, TYPE_STRING_ARR2):
+        rows = re.split(r"[;；\n]+", text)
+        return [re.split(r"[,，]+", row.strip()) for row in rows if row.strip()]
+
+    if typ in (TYPE_INT_ARR, TYPE_FLOAT_ARR, TYPE_STRING_ARR):
+        return [item.strip() for item in re.split(r"[,，;；\n]+", text) if item.strip()]
+
+    return parsed
+
+
 def _cast_scalar(value: Any, typ: str) -> Any:
     if value is None:
         return None
@@ -223,7 +260,7 @@ def _cast_by_type(value: Any, typ: str) -> Any:
         return None
     if typ in (TYPE_STRING, TYPE_INT, TYPE_FLOAT):
         return _cast_scalar(value, typ)
-    parsed = _parse_json_text(value)
+    parsed = _parse_array_text(value, typ)
     if typ == TYPE_INT_ARR:
         return [int(float(x)) for x in _ensure_array_value(parsed, TYPE_INT)]
     if typ == TYPE_FLOAT_ARR:
